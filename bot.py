@@ -5,13 +5,15 @@
 import datetime
 import argparse
 import asyncio
+import math
+
 import discord
 import random
 import copy
 import json
 import os
 
-
+from db import queries, ctx
 
 PREFIX = ".pz" # Prefix for user commands.
 CONFIG_FILE = "config.json" # Config file location.
@@ -26,7 +28,11 @@ DEFAULT_CONFIG = {
 	"nearby_messages": 5,
 	"initial_infected": 132185638983303168,
 	"max_time_difference_seconds": 60,
-	"incubation_time_seconds": 60
+	"incubation_time_seconds": 60,
+
+	"infection_points": 5,
+
+	"redis_host": "0@localhost:6379"
 }
 
 
@@ -43,9 +49,21 @@ def read_config_file():
 	return conf
 
 
+def lvl2str(n):
+	lvlstr = []
+	for d in str(n):
+		if d == '0': lvlstr.append(":zero:")
+		elif d == '1': lvlstr.append(":one:")
+		elif d == '2': lvlstr.append(":two:")
+		elif d == '3': lvlstr.append(":three:")
+		elif d == '4': lvlstr.append(":four:")
+		elif d == '5': lvlstr.append(":five:")
+		elif d == '6': lvlstr.append(":six:")
+		elif d == '7': lvlstr.append(":seven:")
+		elif d == '8': lvlstr.append(":eight:")
+		elif d == '9': lvlstr.append(":nine:")
 
-
-
+	return ' '.join(lvlstr)
 
 
 
@@ -116,13 +134,6 @@ parser.add_argument(
 )
 
 
-
-
-
-
-
-
-
 class Client(discord.Client):
 	def __init__(self, config):
 		super().__init__()
@@ -138,6 +149,8 @@ class Client(discord.Client):
 
 	def run(self):
 		print("[-] Starting.")
+
+		ctx.init(self, self.config["redis_host"])
 		super().run(self.config["bot_token"])
 
 
@@ -233,6 +246,27 @@ class Client(discord.Client):
 		if message.author == self.user or isinstance(message.author, discord.User):
 			return
 
+		user = queries.get_user(message.author.id, message.author.name)
+
+		# Get global message channel
+		global_status_channel = self.get_channel(self.config["global_status_channel_id"])
+
+		# Command i know it's ugly:
+		if message.content.startswith("check"):
+			if message.mentions:
+				c_user = queries.get_user(message.mentions[0].id, message.mentions[0].name)
+				self.calculate_level(c_user)
+
+				if global_status_channel is not None:
+					await global_status_channel.send(f"{c_user.name}'s level: {lvl2str(c_user.lvl)}. You infected {c_user.infected} people and {c_user.infected_me} people have infected {c_user.name}.")
+				return
+
+			else:
+				self.calculate_level(user)
+
+				if global_status_channel is not None:
+					await global_status_channel.send(f"Your level: {lvl2str(user.lvl)}. You infected {user.infected} people and {user.infected_me} people have infected you.")
+				return
 
 		# Get infected role and check if member is infected.
 		infected_role = await self.get_infected_role(message.guild)
@@ -243,7 +277,6 @@ class Client(discord.Client):
 
 		# At this point the author is valid and infected.
 		print(f"[!] Member '{message.author}' is infected, checking nearby messages.")
-
 
 		# Keep track of users we've seen, this will stop multiple infections
 		# to the same person.
@@ -269,13 +302,13 @@ class Client(discord.Client):
 			if msg.author.id in seen_users or msg.author.id in self.incubating:
 				continue
 
+
 			seen_users.add(msg.author.id)
 
 
 			# Check if member is already infected.
 			if infected_role in msg.author.roles:
 				continue
-
 
 			# Decide whether or not to infect this user.
 			n = self.config["nearby_messages"]  # number of messages to check
@@ -296,11 +329,8 @@ class Client(discord.Client):
 
 				status = f"{message.author.name}#{message.author.discriminator}{src_nick} infected {msg.author.name}#{msg.author.discriminator}{dest_nick} in '{message.guild.name}'."
 
-
-				# Get global status channel and local status channel.
-				global_status_channel = self.get_channel(self.config["global_status_channel_id"])
+				# Get local status channel.
 				local_status_channel = discord.utils.get(message.guild.text_channels, name = "pz-log")
-
 
 				# Send new status message.
 				if global_status_channel is not None:
@@ -309,6 +339,28 @@ class Client(discord.Client):
 				if local_status_channel is not None:
 					await local_status_channel.send(content = status)
 
+				# Save scores in DB
+				old_lvl = user.lvl
+				user.infected += 1
+				self.calculate_level(user)
+				queries.set_user(user)
+
+				# Level up status message
+				if old_lvl < user.lvl:
+					await global_status_channel.send(f"\n {lvl2str(user.lvl)} {message.author.name}#{message.author.discriminator}{src_nick} has leveled up! You have infected :face_vomiting: {user.infected} people!")
+					# https://www.youtube.com/watch?v=bLMWYcQ1fAo
+
+				# Save infected user's stats in DB:
+				user2 = queries.get_user(msg.author.id, msg.author.name)
+				if user2:
+					user2.infected_me += 1
+					old_lvl2 = user2.lvl
+					self.calculate_level(user2)
+					queries.set_user(user2)
+
+					# Level up message for the passive user:
+					if old_lvl2 < user2.lvl:
+						await global_status_channel.send(content=f"\n {lvl2str(user.lvl)} {msg.author.name}#{msg.author.discriminator}{dest_nick} has leveled up! You have been infected :nauseated_face: {user2.infected_me} times!")
 
 				# Add user to incubating set and then sleep in a non blocking way.
 				self.incubating.add(msg.author.id)
@@ -325,6 +377,15 @@ class Client(discord.Client):
 
 		print("\t[-] Done!")
 
+	def calculate_level(self, user):
+		# zombie lvl: how many people infected you
+		passive_infected_xp = user.infected_me * self.config['infection_points']
+		# infector lvl: how many people you have infected
+		active_infected_xp = user.infected * self.config['infection_points']
+
+		# These are Read-only attributes, actually:
+		user.xp += active_infected_xp + passive_infected_xp
+		user.lvl = max(1, math.floor(math.sqrt((22 / 7) * passive_infected_xp + 2 ** (active_infected_xp / 65)) - 2))
 
 
 def main():
